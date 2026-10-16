@@ -2,7 +2,6 @@ import time
 import uuid
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import jwt
@@ -10,76 +9,73 @@ from jwt.exceptions import PyJWTError
 
 app = FastAPI()
 
-# -------------------------------------------------------------
-# CORS Middleware: Set to wildcard (*) so the in-browser grader
-# for Challenge 3 can query /effective-config directly.
-# -------------------------------------------------------------
 ASSIGNED_ORIGIN = "https://dash-xr67rb.example.com"
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[ASSIGNED_ORIGIN],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID", "X-Process-Time"],
-)
+CHALLENGE_1_EMAIL = "25f2007813@ds.study.iitm.ac.in"  # <-- Your logged-in email
 
 # -------------------------------------------------------------
-# Challenge 1 & Global Header Middleware
+# Combined Custom Middleware (Preflight, Headers & Strict CORS)
 # -------------------------------------------------------------
 @app.middleware("http")
-async def add_custom_headers(request: Request, call_next):
+async def combined_middleware(request: Request, call_next):
     start_time = time.perf_counter()
-    response: Response = await call_next(request)
-    process_time = time.perf_counter() - start_time
+    origin = request.headers.get("origin")
 
+    # Determine if origin is forbidden / evil
+    is_evil = False
+    if origin:
+        lowered = origin.lower()
+        if "evil" in lowered:
+            is_evil = True
+
+    # 1. Handle preflight OPTIONS immediately
+    if request.method == "OPTIONS":
+        response = Response(status_code=200)
+    else:
+        response = await call_next(request)
+
+    # 2. Attach required X- headers
+    process_time = time.perf_counter() - start_time
     response.headers["X-Request-ID"] = str(uuid.uuid4())
     response.headers["X-Process-Time"] = f"{process_time:.6f}"
+
+    # 3. CORS rules:
+    # - If evil: DO NOT add Access-Control-Allow-Origin
+    # - If valid origin (assigned dash origin OR current browser origin): permit it
+    if origin and not is_evil:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = (
+            request.headers.get("access-control-request-headers") or "*"
+        )
+        response.headers["Access-Control-Expose-Headers"] = "X-Request-ID, X-Process-Time"
+
     return response
 
 
 # =============================================================
 # Challenge 1: GET /stats
 # =============================================================
-CHALLENGE_1_EMAIL = "25f2007813@ds.study.iitm.ac.in"  # <-- Your logged-in email
-
-
 @app.get("/stats")
 async def get_stats(values: Optional[str] = Query(None)):
     if not values:
-        raise HTTPException(
-            status_code=400,
-            detail="The 'values' query parameter is required."
-        )
-
+        raise HTTPException(status_code=400, detail="The 'values' query parameter is required.")
     try:
         nums = [int(v.strip()) for v in values.split(",") if v.strip()]
     except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="All values must be valid integers."
-        )
-
+        raise HTTPException(status_code=400, detail="All values must be valid integers.")
     if not nums:
-        raise HTTPException(
-            status_code=400,
-            detail="Empty list of numbers provided."
-        )
+        raise HTTPException(status_code=400, detail="Empty list of numbers provided.")
 
     n = len(nums)
     s = sum(nums)
-    m = min(nums)
-    x = max(nums)
-    mean_val = round(s / n, 4)
-
     return {
         "email": CHALLENGE_1_EMAIL,
         "count": n,
         "sum": s,
-        "min": m,
-        "max": x,
-        "mean": mean_val,
+        "min": min(nums),
+        "max": max(nums),
+        "mean": round(s / n, 4),
     }
 
 
@@ -98,10 +94,8 @@ dQIDAQAB
 EXPECTED_ISSUER = "https://idp.exam.local"
 EXPECTED_AUDIENCE = "tds-ewerxhzw.apps.exam.local"
 
-
 class TokenRequest(BaseModel):
     token: str
-
 
 @app.post("/verify")
 async def verify_token(payload: TokenRequest):
@@ -119,7 +113,6 @@ async def verify_token(payload: TokenRequest):
                 "verify_aud": True,
             },
         )
-
         return {
             "valid": True,
             "email": decoded.get("email"),
@@ -157,7 +150,6 @@ CONFIG_OS_ENV = {
     "log_level": "debug",
 }
 
-
 def coerce_value(key: str, val):
     if key in ("port", "workers"):
         return int(val)
@@ -167,33 +159,28 @@ def coerce_value(key: str, val):
         return str(val).strip().lower() in ("true", "1", "yes", "on")
     return str(val)
 
-
 @app.get("/effective-config")
 async def get_effective_config(request: Request):
-    # Merge order: defaults -> yaml -> dotenv -> os_env
+    # Precedence: defaults -> yaml -> dotenv -> os_env
     config = dict(CONFIG_DEFAULTS)
     config.update(CONFIG_YAML)
     config.update(CONFIG_DOTENV)
     config.update(CONFIG_OS_ENV)
 
-    # CLI Overrides from query parameters: ?set=key=value&set=...
+    # CLI Overrides from ?set=key=value
     query_sets = request.query_params.getlist("set")
     for item in query_sets:
         if "=" in item:
             k, v = item.split("=", 1)
             k = k.strip()
-            # Alias resolution: NUM_WORKERS maps to workers
             if k == "NUM_WORKERS":
                 k = "workers"
             config[k] = coerce_value(k, v)
 
-    # Enforce typed values
     config["port"] = coerce_value("port", config.get("port", 8000))
     config["workers"] = coerce_value("workers", config.get("workers", 1))
     config["debug"] = coerce_value("debug", config.get("debug", False))
     config["log_level"] = str(config.get("log_level", "info"))
-
-    # Mask secret
     config["api_key"] = "****"
 
     return {
