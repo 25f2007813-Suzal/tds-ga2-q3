@@ -14,15 +14,16 @@ app = FastAPI()
 # CORS Middleware: Set to wildcard (*) so the in-browser grader
 # for Challenge 3 can query /effective-config directly.
 # -------------------------------------------------------------
+ASSIGNED_ORIGIN = "https://dash-xr67rb.example.com"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[ASSIGNED_ORIGIN],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["X-Request-ID", "X-Process-Time"],
 )
-
 
 # -------------------------------------------------------------
 # Challenge 1 & Global Header Middleware
