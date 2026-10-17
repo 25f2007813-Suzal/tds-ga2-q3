@@ -1,11 +1,14 @@
+from collections import defaultdict
 import time
+from typing import List, Optional
 import uuid
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 import jwt
 from jwt.exceptions import PyJWTError
+from pydantic import BaseModel
+
 
 app = FastAPI()
 
@@ -189,4 +192,57 @@ async def get_effective_config(request: Request):
         "debug": config["debug"],
         "log_level": config["log_level"],
         "api_key": config["api_key"],
+    }
+
+# Question 7
+ASSIGNED_API_KEY = "ak_in653ejtxtku5wiu2vogrcx5"
+CHALLENGE_EMAIL = "25f2007813@ds.study.iitm.ac.in"  # <-- Your logged-in platform email
+
+
+class EventItem(BaseModel):
+    user: str
+    amount: float
+    ts: Optional[float] = None
+
+
+class AnalyticsPayload(BaseModel):
+    events: List[EventItem]
+
+@app.post("/analytics")
+async def post_analytics(
+    payload: AnalyticsPayload,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    # 1. Require X-API-Key header, return 401 if missing or wrong
+    if not x_api_key or x_api_key != ASSIGNED_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API Key",
+        )
+
+    events = payload.events
+    total_events = len(events)
+    unique_users = len({e.user for e in events})
+
+    # 2. Revenue: sum of positive amounts only (amount > 0)
+    # 3. Top user: user with the highest positive-amount total
+    user_positive_totals = defaultdict(float)
+    total_revenue = 0.0
+
+    for e in events:
+        if e.amount > 0:
+            total_revenue += e.amount
+            user_positive_totals[e.user] += e.amount
+
+    if user_positive_totals:
+        top_user = max(user_positive_totals.items(), key=lambda x: x[1])[0]
+    else:
+        top_user = events[0].user if events else ""
+
+    return {
+        "email": CHALLENGE_EMAIL,
+        "total_events": total_events,
+        "unique_users": unique_users,
+        "revenue": round(total_revenue, 4),
+        "top_user": top_user,
     }
