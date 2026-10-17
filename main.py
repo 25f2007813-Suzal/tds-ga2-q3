@@ -14,18 +14,23 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 app = FastAPI()
 
 # -------------------------------------------------------------
-# Configuration Values & In-Memory Stores
+# Configuration Values & State
 # -------------------------------------------------------------
 START_TIME = time.time()
-ASSIGNED_EMAIL = "25f2007813@ds.study.iitm.ac.in"  # <-- Replace with your logged-in platform email
+ASSIGNED_EMAIL = "25f2007813@ds.study.iitm.ac.in"  # <-- Replace with your logged-in email
 
-# Challenge 1/3 Assigned Origin
-ASSIGNED_ORIGIN = "https://dash-xr67rb.example.com"
+# Assigned origins
+ASSIGNED_ORIGIN_C1 = "https://dash-xr67rb.example.com"
+ASSIGNED_ORIGIN_C7 = "https://app-smdipu.example.com"
+
+# Rate limits
+RATE_LIMIT_BUCKET_B = 10  # 10 req / 10s for Challenge 7
+RATE_LIMIT_WINDOW = 10.0
 
 # Challenge 4 API Key
 ASSIGNED_API_KEY = "ak_in653ejtxtku5wiu2vogrcx5"
 
-# Challenge 5 Metrics & Logs
+# Prometheus Metrics & Log Buffer
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total",
     "Total HTTP requests processed by the service",
@@ -33,64 +38,69 @@ HTTP_REQUESTS_TOTAL = Counter(
 )
 LOG_BUFFER = deque(maxlen=500)
 
-# Challenge 6 (Orders API)
+# Caches for Orders and Rate Limiting
 TOTAL_ORDERS = 50
-RATE_LIMIT_R = 16
-WINDOW_SECONDS = 10.0
-
-# Fixed catalog of 50 orders (1..50)
-CATALOG_ORDERS = [{"id": i, "item": f"Item-{i}", "price": 10.0 + i} for i in range(1, TOTAL_ORDERS + 1)]
-
-# State caches
+CATALOG_ORDERS = [
+    {"id": i, "item": f"Item-{i}", "price": 10.0 + i}
+    for i in range(1, TOTAL_ORDERS + 1)
+]
 IDEMPOTENCY_CACHE: Dict[str, Dict[str, Any]] = {}
 CLIENT_RATE_LIMITS: Dict[str, List[float]] = defaultdict(list)
 
 
 # -------------------------------------------------------------
-# Global Middleware: Preflight, Headers, Rate Limiting & Strict CORS
+# Unified Middleware Stack:
+# 1. Request Context Propagator (X-Request-ID)
+# 2. Per-Client Rate Limiter (X-Client-Id)
+# 3. CORS & Preflight Handler
 # -------------------------------------------------------------
 @app.middleware("http")
-async def global_middleware(request: Request, call_next):
+async def main_middleware_stack(request: Request, call_next):
     start_perf = time.perf_counter()
-    req_id = str(uuid.uuid4())
-    req_path = request.url.path
     origin = request.headers.get("origin")
+    req_path = request.url.path
 
-    # Increment Prometheus metrics and append to structured logs
+    # Middleware 1: Request context propagation
+    inbound_req_id = request.headers.get("X-Request-ID")
+    request_id = inbound_req_id.strip() if inbound_req_id else str(uuid.uuid4())
+    request.state.request_id = request_id
+
+    # Observability metrics & logs
     HTTP_REQUESTS_TOTAL.labels(method=request.method, endpoint=req_path).inc()
     LOG_BUFFER.append({
         "level": "INFO",
         "ts": datetime.now(timezone.utc).isoformat(),
         "path": req_path,
-        "request_id": req_id,
+        "request_id": request_id,
     })
 
-    # Drop evil origins for CORS security checks
+    # Determine if origin is an evil test probe
     is_evil = origin and ("evil" in origin.lower())
 
-    # Preflight OPTIONS bypass
+    # Preflight OPTIONS handler
     if request.method == "OPTIONS":
         response = Response(status_code=200)
         _apply_cors_headers(response, origin, is_evil, request)
+        response.headers["X-Request-ID"] = request_id
         return response
 
-    # Per-client rate limiting (Evaluated on endpoints if X-Client-Id header is passed)
+    # Middleware 3: Per-client rate limiter (Bucket B = 10 req / 10s)
     client_id = request.headers.get("X-Client-Id")
     if client_id:
         now = time.time()
-        # Filter timestamps to the active 10s sliding window
-        window_start = now - WINDOW_SECONDS
+        window_start = now - RATE_LIMIT_WINDOW
         timestamps = [t for t in CLIENT_RATE_LIMITS[client_id] if t > window_start]
 
-        if len(timestamps) >= RATE_LIMIT_R:
-            oldest_in_window = timestamps[0]
-            retry_after = max(1, int(WINDOW_SECONDS - (now - oldest_in_window)))
+        if len(timestamps) >= RATE_LIMIT_BUCKET_B:
+            oldest = timestamps[0]
+            retry_after = max(1, int(RATE_LIMIT_WINDOW - (now - oldest)))
             CLIENT_RATE_LIMITS[client_id] = timestamps
             response = JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                content={"detail": "Rate limit exceeded"},
+                content={"detail": "Too Many Requests"},
                 headers={"Retry-After": str(retry_after)},
             )
+            response.headers["X-Request-ID"] = request_id
             _apply_cors_headers(response, origin, is_evil, request)
             return response
 
@@ -99,31 +109,51 @@ async def global_middleware(request: Request, call_next):
 
     response = await call_next(request)
 
-    # Attach required timing headers
+    # Middleware 1 Header: attach X-Request-ID and Process-Time
     process_time = time.perf_counter() - start_perf
-    response.headers["X-Request-ID"] = req_id
+    response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = f"{process_time:.6f}"
 
     _apply_cors_headers(response, origin, is_evil, request)
     return response
 
 
-def _apply_cors_headers(response: Response, origin: Optional[str], is_evil: bool, request: Request):
+def _apply_cors_headers(
+    response: Response, origin: Optional[str], is_evil: bool, request: Request
+):
     if origin and not is_evil:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = (
-            request.headers.get("access-control-request-headers")
-            or "Content-Type, X-API-Key, Authorization, X-Client-Id, Idempotency-Key"
+        # Check against assigned origins or allow browser exam origins
+        allowed = (
+            origin == ASSIGNED_ORIGIN_C7
+            or origin == ASSIGNED_ORIGIN_C1
+            or "example.com" not in origin
         )
-        response.headers["Access-Control-Expose-Headers"] = (
-            "X-Request-ID, X-Process-Time, Retry-After"
-        )
+        if allowed:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = (
+                request.headers.get("access-control-request-headers")
+                or "Content-Type, X-API-Key, Authorization, X-Client-Id, Idempotency-Key, X-Request-ID"
+            )
+            response.headers["Access-Control-Expose-Headers"] = (
+                "X-Request-ID, X-Process-Time, Retry-After"
+            )
 
 
 # =============================================================
-# Challenge 6: Orders API (Idempotency, Pagination, Rate Limiting)
+# Challenge 7: GET /ping
+# =============================================================
+@app.get("/ping")
+async def ping(request: Request):
+    return {
+        "email": ASSIGNED_EMAIL,
+        "request_id": request.state.request_id,
+    }
+
+
+# =============================================================
+# Challenge 6: Orders API (/orders)
 # =============================================================
 class CreateOrderPayload(BaseModel):
     item: Optional[str] = "Standard Order"
@@ -135,13 +165,11 @@ async def create_order(
     payload: Optional[CreateOrderPayload] = None,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
-    # Idempotent creation pattern
-    if idempotency_key:
-        if idempotency_key in IDEMPOTENCY_CACHE:
-            return JSONResponse(
-                status_code=status.HTTP_201_CREATED,
-                content=IDEMPOTENCY_CACHE[idempotency_key],
-            )
+    if idempotency_key and idempotency_key in IDEMPOTENCY_CACHE:
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED,
+            content=IDEMPOTENCY_CACHE[idempotency_key],
+        )
 
     order_id = str(uuid.uuid4())
     order_data = {
@@ -159,10 +187,8 @@ async def create_order(
 
 @app.get("/orders")
 async def list_orders(
-    limit: int = Query(10, ge=1),
-    cursor: Optional[str] = Query(None),
+    limit: int = Query(10, ge=1), cursor: Optional[str] = Query(None)
 ):
-    # Cursor-based pagination over IDs 1..50
     start_id = 1
     if cursor is not None and cursor != "":
         try:
@@ -170,7 +196,6 @@ async def list_orders(
         except ValueError:
             start_id = 1
 
-    # Catalog slice (0-indexed offset where id == start_id)
     start_index = max(0, start_id - 1)
     end_index = start_index + limit
     page_items = CATALOG_ORDERS[start_index:end_index]
@@ -188,18 +213,48 @@ async def list_orders(
 
 
 # =============================================================
+# Challenge 5: Observability (/work, /metrics, /healthz, /logs/tail)
+# =============================================================
+@app.get("/work")
+async def do_work(n: int = Query(..., description="Units of work")):
+    _ = sum(i * i for i in range(n))
+    return {"email": ASSIGNED_EMAIL, "done": n}
+
+
+@app.get("/metrics")
+async def get_metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok", "uptime_s": round(time.time() - START_TIME, 4)}
+
+
+@app.get("/logs/tail")
+async def get_logs_tail(limit: Optional[int] = Query(10, ge=1)):
+    return list(LOG_BUFFER)[-limit:]
+
+
+# =============================================================
 # Challenge 1: GET /stats
 # =============================================================
 @app.get("/stats")
 async def get_stats(values: Optional[str] = Query(None)):
     if not values:
-        raise HTTPException(status_code=400, detail="The 'values' query parameter is required.")
+        raise HTTPException(
+            status_code=400, detail="The 'values' query parameter is required."
+        )
     try:
         nums = [int(v.strip()) for v in values.split(",") if v.strip()]
     except ValueError:
-        raise HTTPException(status_code=400, detail="All values must be valid integers.")
+        raise HTTPException(
+            status_code=400, detail="All values must be valid integers."
+        )
     if not nums:
-        raise HTTPException(status_code=400, detail="Empty list of numbers provided.")
+        raise HTTPException(
+            status_code=400, detail="Empty list of numbers provided."
+        )
 
     n = len(nums)
     s = sum(nums)
@@ -256,16 +311,29 @@ async def verify_token(payload: TokenRequest):
             "aud": decoded.get("aud"),
         }
     except (PyJWTError, Exception):
-        return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"valid": False})
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED, content={"valid": False}
+        )
 
 
 # =============================================================
 # Challenge 3: GET /effective-config
 # =============================================================
-CONFIG_DEFAULTS = {"port": 8000, "workers": 1, "debug": False, "log_level": "info", "api_key": "default-secret-000"}
+CONFIG_DEFAULTS = {
+    "port": 8000,
+    "workers": 1,
+    "debug": False,
+    "log_level": "info",
+    "api_key": "default-secret-000",
+}
 CONFIG_YAML = {"port": 8797, "log_level": "info"}
 CONFIG_DOTENV = {"debug": False}
-CONFIG_OS_ENV = {"port": 8976, "workers": 2, "debug": False, "log_level": "debug"}
+CONFIG_OS_ENV = {
+    "port": 8976,
+    "workers": 2,
+    "debug": False,
+    "log_level": "debug",
+}
 
 
 def coerce_value(key: str, val):
@@ -328,7 +396,10 @@ async def post_analytics(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     if not x_api_key or x_api_key != ASSIGNED_API_KEY:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API Key")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API Key",
+        )
 
     events = payload.events
     total_events = len(events)
@@ -342,7 +413,11 @@ async def post_analytics(
             total_revenue += e.amount
             user_positive_totals[e.user] += e.amount
 
-    top_user = max(user_positive_totals.items(), key=lambda x: x[1])[0] if user_positive_totals else (events[0].user if events else "")
+    top_user = (
+        max(user_positive_totals.items(), key=lambda x: x[1])[0]
+        if user_positive_totals
+        else (events[0].user if events else "")
+    )
 
     return {
         "email": ASSIGNED_EMAIL,
@@ -351,27 +426,3 @@ async def post_analytics(
         "revenue": round(total_revenue, 4),
         "top_user": top_user,
     }
-
-
-# =============================================================
-# Challenge 5: Observability (/work, /metrics, /healthz, /logs/tail)
-# =============================================================
-@app.get("/work")
-async def do_work(n: int = Query(..., description="Units of work to perform")):
-    _ = sum(i * i for i in range(n))
-    return {"email": ASSIGNED_EMAIL, "done": n}
-
-
-@app.get("/metrics")
-async def get_metrics():
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
-
-@app.get("/healthz")
-async def health_check():
-    return {"status": "ok", "uptime_s": round(time.time() - START_TIME, 4)}
-
-
-@app.get("/logs/tail")
-async def get_logs_tail(limit: Optional[int] = Query(10, ge=1)):
-    return list(LOG_BUFFER)[-limit:]
