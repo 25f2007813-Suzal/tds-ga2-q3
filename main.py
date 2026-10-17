@@ -447,3 +447,14 @@ async def get_ollama_answer():
             "error": "model unloaded",
         },
     }
+
+
+@app.get("/docker-cache-answer")
+async def get_docker_cache_answer():
+    return {
+        "A": {"steps": ["L3", "L4", "L5"], "seconds": 40},
+        "B": {"steps": ["L1", "L2", "L3", "L4", "L5"], "seconds": 83},
+        "C": {"steps": [], "seconds": 0},
+        "D": {"steps": [], "seconds": 0},
+        "E": {"steps": ["L4", "L5"], "seconds": 40},
+    }
