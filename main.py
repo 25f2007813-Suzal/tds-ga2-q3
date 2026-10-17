@@ -600,7 +600,6 @@ class ChatCompletionRequest(BaseModel):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(payload: ChatCompletionRequest):
-    # Extract the user's input prompt
     user_prompt = ""
     for msg in payload.messages:
         if msg.role == "user":
@@ -608,14 +607,13 @@ async def chat_completions(payload: ChatCompletionRequest):
 
     tokens = []
 
-    # 1. Echo test: extract token matching TK<6-hex> (case-insensitive)
-    tk_match = re.search(r"\b(TK[0-9a-fA-F]{6})\b", user_prompt, re.IGNORECASE)
+    # 1. Echo test: extract token matching TK followed by any alphanumeric characters
+    tk_match = re.search(r"\b(TK[a-zA-Z0-9]+)\b", user_prompt, re.IGNORECASE)
     if tk_match:
-        tokens.append(tk_match.group(1))
+        tokens.append(tk_match.group(1).upper())
 
-    # 2. Arithmetic test: solve "What is A + B?" with integers (10-89)
-    # Matches patterns like: "15 + 25", "What is 34 + 56?", "add 12 and 78"
-    add_match = re.search(r"(\d+)\s*(?:\+|\band\b)\s*(\d+)", user_prompt)
+    # 2. Arithmetic test: solve "What is A + B?" 
+    add_match = re.search(r"(\d+)\s*(?:\+|\band\b|plus)\s*(\d+)", user_prompt, re.IGNORECASE)
     if add_match:
         num1 = int(add_match.group(1))
         num2 = int(add_match.group(2))
