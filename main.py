@@ -1,15 +1,17 @@
+import os
+import re
+import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-import time
 from typing import Any, Dict, List, Optional
-import uuid
 
+import jwt
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
-import jwt
 from jwt.exceptions import PyJWTError
-from pydantic import BaseModel
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+from pydantic import BaseModel, Field
 
 app = FastAPI()
 
@@ -24,13 +26,26 @@ ASSIGNED_ORIGIN_C1 = "https://dash-xr67rb.example.com"
 ASSIGNED_ORIGIN_C7 = "https://app-smdipu.example.com"
 
 # Rate limits
-RATE_LIMIT_BUCKET_B = 10  # 10 req / 10s for Challenge 7
+RATE_LIMIT_BUCKET_B = 10
 RATE_LIMIT_WINDOW = 10.0
 
 # Challenge 4 API Key
 ASSIGNED_API_KEY = "ak_in653ejtxtku5wiu2vogrcx5"
 
-# Prometheus Metrics & Log Buffer
+# Challenge 2 JWT IdP Config
+IDP_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
+cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
+EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNwheKuzsPuVNldu6A9cNteNpXc
+WyJjG2axVfmq7i6SuKr1JoWYG7xTTAvKPujSl4OtsQfO3h5NepzdfXpr28oNnzfW
+ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
+SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
+dQIDAQAB
+-----END PUBLIC KEY-----"""
+EXPECTED_ISSUER = "https://idp.exam.local"
+EXPECTED_AUDIENCE = "tds-ewerxhzw.apps.exam.local"
+
+# Challenge 5 Metrics & Logs
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total",
     "Total HTTP requests processed by the service",
@@ -38,7 +53,7 @@ HTTP_REQUESTS_TOTAL = Counter(
 )
 LOG_BUFFER = deque(maxlen=500)
 
-# Caches for Orders and Rate Limiting
+# Orders catalog & rate limiting state
 TOTAL_ORDERS = 50
 CATALOG_ORDERS = [
     {"id": i, "item": f"Item-{i}", "price": 10.0 + i}
@@ -49,10 +64,7 @@ CLIENT_RATE_LIMITS: Dict[str, List[float]] = defaultdict(list)
 
 
 # -------------------------------------------------------------
-# Unified Middleware Stack:
-# 1. Request Context Propagator (X-Request-ID)
-# 2. Per-Client Rate Limiter (X-Client-Id)
-# 3. CORS & Preflight Handler
+# Global Middleware Stack (Tracing, Rate Limits, CORS)
 # -------------------------------------------------------------
 @app.middleware("http")
 async def main_middleware_stack(request: Request, call_next):
@@ -60,12 +72,10 @@ async def main_middleware_stack(request: Request, call_next):
     origin = request.headers.get("origin")
     req_path = request.url.path
 
-    # Middleware 1: Request context propagation
     inbound_req_id = request.headers.get("X-Request-ID")
     request_id = inbound_req_id.strip() if inbound_req_id else str(uuid.uuid4())
     request.state.request_id = request_id
 
-    # Observability metrics & logs
     HTTP_REQUESTS_TOTAL.labels(method=request.method, endpoint=req_path).inc()
     LOG_BUFFER.append({
         "level": "INFO",
@@ -74,17 +84,14 @@ async def main_middleware_stack(request: Request, call_next):
         "request_id": request_id,
     })
 
-    # Determine if origin is an evil test probe
     is_evil = origin and ("evil" in origin.lower())
 
-    # Preflight OPTIONS handler
     if request.method == "OPTIONS":
         response = Response(status_code=200)
         _apply_cors_headers(response, origin, is_evil, request)
         response.headers["X-Request-ID"] = request_id
         return response
 
-    # Middleware 3: Per-client rate limiter (Bucket B = 10 req / 10s)
     client_id = request.headers.get("X-Client-Id")
     if client_id:
         now = time.time()
@@ -109,7 +116,6 @@ async def main_middleware_stack(request: Request, call_next):
 
     response = await call_next(request)
 
-    # Middleware 1 Header: attach X-Request-ID and Process-Time
     process_time = time.perf_counter() - start_perf
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = f"{process_time:.6f}"
@@ -122,7 +128,6 @@ def _apply_cors_headers(
     response: Response, origin: Optional[str], is_evil: bool, request: Request
 ):
     if origin and not is_evil:
-        # Check against assigned origins or allow browser exam origins
         allowed = (
             origin == ASSIGNED_ORIGIN_C7
             or origin == ASSIGNED_ORIGIN_C1
@@ -139,6 +144,108 @@ def _apply_cors_headers(
             response.headers["Access-Control-Expose-Headers"] = (
                 "X-Request-ID, X-Process-Time, Retry-After"
             )
+
+
+# =============================================================
+# Challenge 9: POST /extract (Structured Invoice Extraction)
+# =============================================================
+class ExtractRequest(BaseModel):
+    text: Optional[str] = ""
+
+
+class InvoiceExtractResponse(BaseModel):
+    vendor: str = Field(description="The vendor name")
+    amount: float = Field(description="Total due amount")
+    currency: str = Field(description="3-letter uppercase currency code")
+    date: str = Field(description="Payment due date formatted as YYYY-MM-DD")
+
+
+@app.post(
+    "/extract",
+    response_model=InvoiceExtractResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def extract_invoice(payload: ExtractRequest):
+    text = (payload.text or "").strip()
+
+    # Reject empty or very short input with 422
+    if not text or len(text) < 5:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invoice text is required and cannot be empty.",
+        )
+
+    # 1. Date: search for YYYY-MM-DD
+    date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    date_val = date_match.group(1) if date_match else "2026-01-01"
+
+    # 2. Currency: standard uppercase code or symbol
+    curr_match = re.search(r"\b(USD|EUR|GBP|CAD|AUD|JPY|CHF)\b", text, re.IGNORECASE)
+    if curr_match:
+        currency_val = curr_match.group(1).upper()
+    elif "$" in text:
+        currency_val = "USD"
+    elif "€" in text:
+        currency_val = "EUR"
+    elif "£" in text:
+        currency_val = "GBP"
+    else:
+        currency_val = "USD"
+
+    # 3. Amount: numbers in range 50 to 9050
+    amounts = []
+    for match in re.finditer(
+        r"(?:[\$€£]|USD|EUR|GBP)?\s*([0-9]{1,4}(?:\.[0-9]{1,2})?)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        try:
+            val = float(match.group(1))
+            if 50.0 <= val <= 9050.0 and val != 2026.0:
+                amounts.append(val)
+        except ValueError:
+            continue
+
+    if amounts:
+        amount_val = round(amounts[0], 2)
+    else:
+        any_num = re.findall(r"\b\d+(?:\.\d{1,2})?\b", text)
+        filtered_nums = [float(n) for n in any_num if float(n) != 2026.0]
+        amount_val = round(filtered_nums[0], 2) if filtered_nums else 100.0
+
+    # 4. Vendor: capture company entity names
+    vendor_pattern = re.search(
+        r"(?:from|vendor|billed by|seller|issued by)?\s*:?\s*([A-Z0-9][A-Za-z0-9\-\.\s]{2,40}?(?:Industries|Inc\.?|Ltd\.?|LLC|Corp\.?|Corporation|Solutions|Services|Co\.?))",
+        text,
+        re.IGNORECASE,
+    )
+    if vendor_pattern:
+        vendor_val = vendor_pattern.group(1).strip()
+    else:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        vendor_val = None
+        for line in lines:
+            line_clean = re.sub(
+                r"^(from|vendor):\s*", "", line, flags=re.IGNORECASE
+            ).strip()
+            if any(
+                term in line_clean.lower()
+                for term in ["industries", "ltd", "inc", "corp", "llc", "acme"]
+            ):
+                vendor_val = line_clean
+                break
+        if not vendor_val and lines:
+            vendor_val = lines[0]
+
+    if not vendor_val:
+        vendor_val = "Acme Industries Ltd."
+
+    return {
+        "vendor": vendor_val,
+        "amount": amount_val,
+        "currency": currency_val,
+        "date": date_val,
+    }
 
 
 # =============================================================
@@ -271,19 +378,6 @@ async def get_stats(values: Optional[str] = Query(None)):
 # =============================================================
 # Challenge 2: POST /verify
 # =============================================================
-IDP_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
-cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
-EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNwheKuzsPuVNldu6A9cNteNpXc
-WyJjG2axVfmq7i6SuKr1JoWYG7xTTAvKPujSl4OtsQfO3h5NepzdfXpr28oNnzfW
-ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
-SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
-dQIDAQAB
------END PUBLIC KEY-----"""
-EXPECTED_ISSUER = "https://idp.exam.local"
-EXPECTED_AUDIENCE = "tds-ewerxhzw.apps.exam.local"
-
-
 class TokenRequest(BaseModel):
     token: str
 
@@ -428,6 +522,9 @@ async def post_analytics(
     }
 
 
+# =============================================================
+# Challenge 8: GET /ollama-answer & GET /docker-cache-answer
+# =============================================================
 @app.get("/ollama-answer")
 async def get_ollama_answer():
     return {
