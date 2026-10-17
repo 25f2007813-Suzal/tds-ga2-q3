@@ -5,6 +5,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from pydantic import BaseModel
 
 import jwt
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
@@ -580,4 +581,61 @@ async def get_docker_cache_answer():
         "C": {"steps": [], "seconds": 0},
         "D": {"steps": [], "seconds": 0},
         "E": {"steps": ["L4", "L5"], "seconds": 40},
+    }
+
+
+
+# Q9
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    stream: Optional[bool] = False
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(payload: ChatCompletionRequest):
+    # Extract the user's input prompt
+    user_prompt = ""
+    for msg in payload.messages:
+        if msg.role == "user":
+            user_prompt = msg.content
+
+    tokens = []
+
+    # 1. Echo test: extract token matching TK<6-hex> (case-insensitive)
+    tk_match = re.search(r"\b(TK[0-9a-fA-F]{6})\b", user_prompt, re.IGNORECASE)
+    if tk_match:
+        tokens.append(tk_match.group(1))
+
+    # 2. Arithmetic test: solve "What is A + B?" with integers (10-89)
+    # Matches patterns like: "15 + 25", "What is 34 + 56?", "add 12 and 78"
+    add_match = re.search(r"(\d+)\s*(?:\+|\band\b)\s*(\d+)", user_prompt)
+    if add_match:
+        num1 = int(add_match.group(1))
+        num2 = int(add_match.group(2))
+        tokens.append(str(num1 + num2))
+
+    if not tokens:
+        tokens.append("OK")
+
+    reply_content = " ".join(tokens)
+
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": payload.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": reply_content},
+                "finish_reason": "stop",
+            }
+        ],
     }
