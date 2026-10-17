@@ -426,3 +426,24 @@ async def post_analytics(
         "revenue": round(total_revenue, 4),
         "top_user": top_user,
     }
+
+
+@app.get("/ollama-answer")
+async def get_ollama_answer():
+    return {
+        "A": {
+            "text": "Report job-9bf87db5: café\nReady ✓",
+            "complete": True,
+            "error": None,
+        },
+        "B": {
+            "text": "Partial job-9bf87db5",
+            "complete": False,
+            "error": None,
+        },
+        "C": {
+            "text": "Draft job-9bf87db5",
+            "complete": False,
+            "error": "model unloaded",
+        },
+    }
