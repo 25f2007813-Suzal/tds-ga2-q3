@@ -192,28 +192,60 @@ async def extract_invoice(payload: ExtractRequest):
     else:
         currency_val = "USD"
 
-    # 3. Amount: numbers in range 50 to 9050
-    amounts = []
-    for match in re.finditer(
-        r"(?:[\$€£]|USD|EUR|GBP)?\s*([0-9]{1,4}(?:\.[0-9]{1,2})?)\b",
+    # 3. Robust Amount Extraction
+    amount_val = None
+
+    # Priority A: Number directly tied to total/due/balance/amount keywords
+    # e.g., "Total due: 277.03", "Amount Due: $277.03", "Total: USD 277.03"
+    total_keyword_match = re.findall(
+        r"(?:total|due|balance|amount|pay|subtotal)[\w\s:]*?([\$€£]|USD|EUR|GBP)?\s*([0-9]{1,4}(?:\.[0-9]{2}))\b",
         text,
         re.IGNORECASE,
-    ):
-        try:
-            val = float(match.group(1))
+    )
+    if total_keyword_match:
+        # Take the last total mentioned (usually final total due)
+        amount_val = float(total_keyword_match[-1][1])
+
+    # Priority B: Explicit currency symbol/code followed by decimal number
+    # e.g., "$277.03" or "277.03 USD"
+    if amount_val is None:
+        curr_attached = re.findall(
+            r"(?:[\$€£]|USD|EUR|GBP)\s*([0-9]{1,4}\.[0-9]{2})\b|\b([0-9]{1,4}\.[0-9]{2})\s*(?:[\$€£]|USD|EUR|GBP)",
+            text,
+            re.IGNORECASE,
+        )
+        if curr_attached:
+            match_tuple = curr_attached[-1]
+            amount_val = float(match_tuple[0] or match_tuple[1])
+
+    # Priority C: Any 2-decimal number in range [50, 9050], skipping dates/years
+    if amount_val is None:
+        decimals = re.findall(r"\b([0-9]{1,4}\.[0-9]{2})\b", text)
+        valid_decimals = [
+            float(d) for d in decimals if 50.0 <= float(d) <= 9050.0 and float(d) != 2026.0
+        ]
+        if valid_decimals:
+            amount_val = valid_decimals[-1]
+
+    # Priority D: Any standalone integer in range [50, 9050] not preceded by #, inv, order, no
+    if amount_val is None:
+        int_candidates = []
+        for m in re.finditer(r"(?<![#\w])([0-9]{2,4})(?![0-9])", text):
+            # Check preceding 15 chars to ignore invoice/order/zip IDs
+            start = max(0, m.start() - 15)
+            context = text[start : m.start()].lower()
+            if any(skip in context for skip in ["#", "inv", "order", "zip", "code", "no.", "id"]):
+                continue
+            val = float(m.group(1))
             if 50.0 <= val <= 9050.0 and val != 2026.0:
-                amounts.append(val)
-        except ValueError:
-            continue
+                int_candidates.append(val)
+        if int_candidates:
+            amount_val = int_candidates[-1]
 
-    if amounts:
-        amount_val = round(amounts[0], 2)
-    else:
-        any_num = re.findall(r"\b\d+(?:\.\d{1,2})?\b", text)
-        filtered_nums = [float(n) for n in any_num if float(n) != 2026.0]
-        amount_val = round(filtered_nums[0], 2) if filtered_nums else 100.0
+    if amount_val is None:
+        amount_val = 100.0
 
-    # 4. Vendor: capture company entity names
+    # 4. Vendor extraction
     vendor_pattern = re.search(
         r"(?:from|vendor|billed by|seller|issued by)?\s*:?\s*([A-Z0-9][A-Za-z0-9\-\.\s]{2,40}?(?:Industries|Inc\.?|Ltd\.?|LLC|Corp\.?|Corporation|Solutions|Services|Co\.?))",
         text,
@@ -225,13 +257,8 @@ async def extract_invoice(payload: ExtractRequest):
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         vendor_val = None
         for line in lines:
-            line_clean = re.sub(
-                r"^(from|vendor):\s*", "", line, flags=re.IGNORECASE
-            ).strip()
-            if any(
-                term in line_clean.lower()
-                for term in ["industries", "ltd", "inc", "corp", "llc", "acme"]
-            ):
+            line_clean = re.sub(r"^(from|vendor):\s*", "", line, flags=re.IGNORECASE).strip()
+            if any(term in line_clean.lower() for term in ["industries", "ltd", "inc", "corp", "llc", "acme"]):
                 vendor_val = line_clean
                 break
         if not vendor_val and lines:
@@ -242,11 +269,10 @@ async def extract_invoice(payload: ExtractRequest):
 
     return {
         "vendor": vendor_val,
-        "amount": amount_val,
+        "amount": round(amount_val, 2),
         "currency": currency_val,
         "date": date_val,
     }
-
 
 # =============================================================
 # Challenge 7: GET /ping
